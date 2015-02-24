@@ -1,0 +1,136 @@
+---
+title: "Predicting Exercise Activity Quality"
+author: "Ozan Sayin"
+date: "July 24, 2014"
+output: html_document
+---
+
+The goal of this project is to produce a machine learning algorithm that predicts the quality of a barbell lifting activity. "Quality" of activitiy was defined at 5 discrete levels regarding the manner the activity was carried out: 
+
+- ***Class A:*** Exactly according to the specification 
+- ***Class B:*** Throwing the elbows to the front 
+- ***Class C:*** Lifting the dumbbell only halfway 
+- ***Class D:*** Lowering the dumbbell only halfway 
+- ***Class E:*** Throwing the hips to the front 
+
+The training data where 6 participants were asked to perform the activity in all 5 ways included measurements from accelerometers on the belt, forearm, arm, and dumbell. The source of all the data for this project is at http://groupware.les.inf.puc-rio.br/har.
+
+The class prediction algorithm is the obtained with a Random Forest model after pre-processing the relevant predictors with PCA. 
+
+```{r, echo=FALSE, message=FALSE}
+library(ggplot2)
+library(caret)
+library(doParallel)
+
+train_data <- read.csv("pml-training.csv")
+test_data <- read.csv("pml-testing.csv")
+```
+
+## Building the Algorithm:
+We start off by identifying variables in the data that have NAs and remove those predictors. 
+```{r}
+vars_train <- names(train_data)
+vars_test <- names(test_data)
+
+# Only choose predictors that don't have NAs for both train and test data
+nonNA_vars_train <- vars_train[colSums(is.na(train_data)) == 0]
+nonNA_vars_test <- vars_test[colSums(is.na(test_data)) == 0]
+nonNA_vars <- intersect(nonNA_vars_test,nonNA_vars_train)
+
+train_data <- subset(train_data, select = c(nonNA_vars,"classe"))
+test_data <- subset(test_data, select = c(nonNA_vars,"problem_id"))
+```
+
+We further remove variables that contain time stamps and activity windows. These should not be related to how one performs the activity. After this step, we end up with 53 predictors. 
+```{r}
+train_data <- subset(train_data, select = c(-X,-raw_timestamp_part_1,-raw_timestamp_part_2,-cvtd_timestamp,-new_window,-num_window))
+
+test_data <- subset(test_data, select = c(-X,-raw_timestamp_part_1,-raw_timestamp_part_2,-cvtd_timestamp,-new_window,-num_window))
+
+train_data$user_name <- as.numeric(train_data$user_name)
+test_data$user_name <- as.numeric(test_data$user_name)
+```
+
+Then we divide the train_data into the training set (where we build the model) and testing set (where we test our final model)
+```{r}
+## Divide the training observations to training and testing data 
+inTrain <- createDataPartition(train_data$classe, p=0.6, list = FALSE)
+training <- train_data[inTrain,]
+testing <- train_data[-inTrain,]
+```
+
+It is likely that there is a sizeable amount of correletaion between the 53 accelerometer readings, so we first perform a PCA and keep the principal components that explain 98% of the variance in the training set. For the accuracy and efficiency of the random forest fit, it is important to have predictors with little-to-no correlation with a reduced dimensionality while preserving information. 
+```{r}
+## First, center and scale the data. Necessary for PCA!! 
+preObj <- preProcess(training[,-54],method=c("center","scale"))
+train_preVars <- predict(preObj,training[,-54])
+## Compute the principal components
+pcaObj <- preProcess(train_preVars,method="pca",thresh=0.98)
+train_PC <- predict(pcaObj,train_preVars)
+```
+
+After the PCA, we end up with `r ncol(train_PC)` principal components that we can use as predictors. 
+```{r, echo=FALSE}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+```
+
+```{r,message=FALSE}
+train_PC <- cbind(train_PC,training$classe)
+colnames(train_PC)[ncol(train_PC)] <- "classe"
+ 
+## Fit a random forest model with cross validation 
+rfFit <- train(classe ~.,data=train_PC, method="rf",trControl=trainControl(method="cv"), prox=T)
+ 
+rfFit 
+```
+10-fold cross validation is used during the fitting of the random forest model.
+ 
+```{r}
+rfFit$finalModel
+```
+The expected ***out-of-sample error rate*** is ***`r rfFit$finalModel$err.rate[dim(rfFit$finalModel$err.rate)[1],1] * 100 `%***, which is estimated from the average of the classification error on the 10 different hold-out testing sample sets.
+ 
+Let us now apply our model to the testing set to see how it performs and whether the out-of-sample error estimate we previously obtained from the 10 fold cross-validation seems realistic. 
+```{r}
+## Preprocess the test data in the same way as prior to building the model on the train set
+test_preVars <- predict(preObj,testing[,-54])
+test_PC <- predict(pcaObj,test_preVars)
+ 
+## Predict with random forest
+pred_class <- predict(rfFit,test_PC)
+ 
+pred_result <- confusionMatrix(pred_class, testing$classe)
+pred_result$table 
+ 
+error_on_test <- 1 - pred_result$overall[1]
+names(error_on_test) <- "Error Rate(%)"
+100 * error_on_test 
+```
+ 
+The error we obtained on the test set is very similar to our out-of-sample error estimate, and the learning algorithm seems to be working quite well! 
+ 
+Furthermore, one can get a more detailed insight by investigating the performance of the prediction algorithm on each seperate class. 
+```{r}
+pred_result$byClass
+```
+ 
+```{r, echo=FALSE, message=FALSE}
+## Predict the activity quality of the actual test cases for 2nd part of the course project 
+valid_preVars <- predict(preObj,test_data[,-54])
+valid_PC <- predict(pcaObj,valid_preVars)
+pred_class_valid <- predict(rfFit,valid_PC)
+pred_class_valid <- predict(rfFit,valid_PC,"prob")
+
+answers <- pred_class_valid 
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(answers)
+```
